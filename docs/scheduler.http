@@ -1,0 +1,267 @@
+# HTTP Test Harness — Unified Service Scheduler
+# Compatible with: VS Code REST Client, IntelliJ HTTP Client
+# Install VS Code extension: "REST Client" by Huachao Mao
+#
+# Usage: Click "Send Request" above any ### block
+# Seed data UUIDs from V2__seed_data.sql
+
+@baseUrl = http://localhost:8080
+@dealershipId_london = 11111111-0000-0000-0000-000000000001
+@serviceType_oilChange = 22222222-0000-0000-0000-000000000001
+@serviceType_brake = 22222222-0000-0000-0000-000000000002
+@serviceType_overhaul = 22222222-0000-0000-0000-000000000003
+@tech_alice = 33333333-0000-0000-0000-000000000001
+@tech_bob = 33333333-0000-0000-0000-000000000002
+@tech_carol = 33333333-0000-0000-0000-000000000003
+@bay_a1 = 44444444-0000-0000-0000-000000000001
+@bay_a2 = 44444444-0000-0000-0000-000000000002
+@customer_james = 55555555-0000-0000-0000-000000000001
+@customer_sarah = 55555555-0000-0000-0000-000000000002
+@vehicle_civic = 66666666-0000-0000-0000-000000000001
+@vehicle_corolla = 66666666-0000-0000-0000-000000000002
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH & OBSERVABILITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+### [Health] Overall health check
+GET {{baseUrl}}/q/health
+
+### [Health] Liveness probe
+GET {{baseUrl}}/q/health/live
+
+### [Health] Readiness probe
+GET {{baseUrl}}/q/health/ready
+
+### [Metrics] Prometheus scrape endpoint
+GET {{baseUrl}}/q/metrics
+
+### [OpenAPI] Swagger UI (open in browser)
+# http://localhost:8080/q/swagger-ui
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FR-01: AVAILABILITY CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+
+### [FR-01] Check available slots — Oil Change (45min, skill 1)
+# Expected: 200 OK with list of slots + Cache-Control: public, max-age=15
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId_london}}/availability?service_type_id={{serviceType_oilChange}}&start_date=2026-10-01&end_date=2026-10-07
+
+### [FR-01] Check available slots — Brake Maintenance (60min, skill 3)
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId_london}}/availability?service_type_id={{serviceType_brake}}&start_date=2026-10-01&end_date=2026-10-03
+
+### [FR-01] Check available slots — Comprehensive Overhaul (120min, skill 7)
+# Only Alice (skill 8) qualifies — Carol (2) and Bob (4) filtered out
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId_london}}/availability?service_type_id={{serviceType_overhaul}}&start_date=2026-10-01&end_date=2026-10-01
+
+### [FR-01] ERROR: Missing required query params — should return 400
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId_london}}/availability
+
+### [FR-01] ERROR: Invalid date range (end before start) — should return 400
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId_london}}/availability?service_type_id={{serviceType_oilChange}}&start_date=2026-10-07&end_date=2026-10-01
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FR-02 + FR-03: BOOK APPOINTMENT WITH IDEMPOTENCY
+# ─────────────────────────────────────────────────────────────────────────────
+
+### [FR-02] Happy Path: Book Oil Change — James Wilson, Alice, BAY-A1, Oct 1 09:00
+# Expected: 201 Created with appointment details
+# IMPORTANT: Generate a fresh UUID for Idempotency-Key on each new request
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: a1b2c3d4-e5f6-7890-abcd-ef1234567801
+
+{
+  "customerId":    "{{customer_james}}",
+  "vehicleId":     "{{vehicle_civic}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2026-10-01T09:00:00Z"
+}
+
+### [FR-03] IDEMPOTENCY: Same Idempotency-Key as above — must return SAME 201 response
+# Even if sent 10 times, the result is identical (Redis cache hit, no DB write)
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: a1b2c3d4-e5f6-7890-abcd-ef1234567801
+
+{
+  "customerId":    "{{customer_james}}",
+  "vehicleId":     "{{vehicle_civic}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2026-10-01T09:00:00Z"
+}
+
+### [FR-02] Book concurrent slot — Sarah Wilson, Bob, BAY-A2, SAME timeslot
+# Expected: 201 Created (different tech+bay — no conflict)
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: b2c3d4e5-f6a7-8901-bcde-f12345678902
+
+{
+  "customerId":    "{{customer_sarah}}",
+  "vehicleId":     "{{vehicle_corolla}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_bob}}",
+  "serviceBayId":  "{{bay_a2}}",
+  "startTime":     "2026-10-01T09:00:00Z"
+}
+
+### [FR-02] CONFLICT: Same tech + same slot as first booking — should return 409
+# Demonstrates: Two-tier defense working (Redis lock OR PG GiST exclusion catches this)
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: c3d4e5f6-a7b8-9012-cdef-123456789003
+
+{
+  "customerId":    "{{customer_sarah}}",
+  "vehicleId":     "{{vehicle_corolla}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a2}}",
+  "startTime":     "2026-10-01T09:00:00Z"
+}
+
+### [FR-02] ERROR: Missing Idempotency-Key header — should return 400
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+
+{
+  "customerId":    "{{customer_james}}",
+  "vehicleId":     "{{vehicle_civic}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2026-10-01T09:00:00Z"
+}
+
+### [FR-02] ERROR: Invalid Idempotency-Key (not a UUID) — should return 400
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: not-a-valid-uuid
+
+{
+  "customerId":    "{{customer_james}}",
+  "vehicleId":     "{{vehicle_civic}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2026-10-01T09:00:00Z"
+}
+
+### [FR-02] ERROR: Past start time — should return 400 (Bean Validation: @Future)
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: d4e5f6a7-b8c9-0123-defa-234567890004
+
+{
+  "customerId":    "{{customer_james}}",
+  "vehicleId":     "{{vehicle_civic}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2020-01-01T09:00:00Z"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FR-04: CANCEL APPOINTMENT
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: Replace {appointmentId} with the UUID returned by the POST above
+
+### [FR-04] Cancel appointment — update with actual ID from booking response
+# Expected: 200 OK, status CANCELLED, slot restored in ES within 200ms
+PATCH {{baseUrl}}/api/v1/appointments/REPLACE-WITH-ACTUAL-APPOINTMENT-ID/status
+Content-Type: application/json
+
+{
+  "status": "CANCELLED",
+  "reason": "Customer requested cancellation via mobile application"
+}
+
+### [FR-04] ERROR: Appointment not found — should return 404
+PATCH {{baseUrl}}/api/v1/appointments/00000000-0000-0000-0000-000000000000/status
+Content-Type: application/json
+
+{
+  "status": "CANCELLED",
+  "reason": "Test - non-existent appointment"
+}
+
+### [FR-04] ERROR: Invalid status value — should return 400
+PATCH {{baseUrl}}/api/v1/appointments/REPLACE-WITH-ACTUAL-APPOINTMENT-ID/status
+Content-Type: application/json
+
+{
+  "status": "PENDING",
+  "reason": "Invalid transition"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FULL SCENARIO: Book → Verify Conflict → Cancel → Verify Slot Restored
+# Run these in sequence to test the complete booking lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+### [SCENARIO Step 1] Book Alice for Oct 2 at 10:00
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: e5f6a7b8-c9d0-1234-efab-345678901005
+
+{
+  "customerId":    "{{customer_james}}",
+  "vehicleId":     "{{vehicle_civic}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2026-10-02T10:00:00Z"
+}
+
+### [SCENARIO Step 2] Try to book Alice for SAME slot → 409 Conflict
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: f6a7b8c9-d0e1-2345-fabc-456789012006
+
+{
+  "customerId":    "{{customer_sarah}}",
+  "vehicleId":     "{{vehicle_corolla}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a2}}",
+  "startTime":     "2026-10-02T10:00:00Z"
+}
+
+### [SCENARIO Step 3] Cancel Alice's booking (use ID from Step 1 response)
+PATCH {{baseUrl}}/api/v1/appointments/REPLACE-WITH-STEP1-ID/status
+Content-Type: application/json
+
+{
+  "status": "CANCELLED",
+  "reason": "Testing slot release"
+}
+
+### [SCENARIO Step 4] Now book Alice for the SAME slot again → 201 (slot released)
+# Wait ~200ms for ES sync before checking availability
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: a7b8c9d0-e1f2-3456-abcd-567890123007
+
+{
+  "customerId":    "{{customer_sarah}}",
+  "vehicleId":     "{{vehicle_corolla}}",
+  "dealershipId":  "{{dealershipId_london}}",
+  "serviceTypeId": "{{serviceType_oilChange}}",
+  "technicianId":  "{{tech_alice}}",
+  "serviceBayId":  "{{bay_a1}}",
+  "startTime":     "2026-10-02T10:00:00Z"
+}
