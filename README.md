@@ -589,4 +589,5 @@ netstat -aon | findstr :8080
 | DB Schema (Flyway) | [`src/main/resources/db/migration/V1__init_schema.sql`](src/main/resources/db/migration/V1__init_schema.sql) |
 | Seed Data | [`src/main/resources/db/migration/V2__seed_data.sql`](src/main/resources/db/migration/V2__seed_data.sql) |
 | App Configuration | [`src/main/resources/application.properties`](src/main/resources/application.properties) |
+| System Design Doc | [`../sys_desgin_doc.md`](../sys_desgin_doc.md) |
 | Architecture Guardrails | [`CLAUDE.md`](CLAUDE.md) |
